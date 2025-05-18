@@ -4,91 +4,99 @@
 #include <unistd.h>
 #include <netinet/in.h>
 #include <linux/netfilter.h>
-#include <netinet/ip.h>     // struct iphdr 정의
-#include <netinet/tcp.h>    // struct tcphdr 정의
+#include <netinet/ip.h>
+#include <netinet/tcp.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
 
 char *malicious_host = NULL;
 
-static u_int32_t process_packet(struct nfq_data *tb) {
-    unsigned char *data;
-    int len = nfq_get_payload(tb, &data);
-    if (len <= 0) {
-        printf("FAIL: No payload\n");
-        return 0;
-    }
+static int host_compare(const char *host, const char *mal_host) {
+    // host에 포트번호가 붙어 있을 수 있으니 ':' 앞까지 자름
+    char host_only[256] = {0};
+    const char *colon = strchr(host, ':');
+    int len = colon ? (colon - host) : strlen(host);
+    if (len >= sizeof(host_only)) return 0;
+    strncpy(host_only, host, len);
+    host_only[len] = '\0';
 
-    struct iphdr *iph = (struct iphdr *)data;
-    if (iph->protocol != IPPROTO_TCP) {
-        printf("FAIL: Not TCP\n");
-        return 0;
-    }
-
-    int ip_header_len = iph->ihl * 4;
-    if (ip_header_len < 20 || ip_header_len > len) {
-        printf("FAIL: Invalid IP header length\n");
-        return 0;
-    }
-
-    struct tcphdr *tcph = (struct tcphdr *)(data + ip_header_len);
-    int tcp_header_len = tcph->doff * 4;
-    if (tcp_header_len < 20 || ip_header_len + tcp_header_len > len) {
-        printf("FAIL: Invalid TCP header length\n");
-        return 0;
-    }
-
-    int http_payload_len = len - ip_header_len - tcp_header_len;
-    if (http_payload_len <= 0) {
-        printf("FAIL: No HTTP payload\n");
-        return 0;
-    }
-
-    char *http_payload = (char *)(data + ip_header_len + tcp_header_len);
-    char *host_pos = strcasestr(http_payload, "Host: ");
-    if (!host_pos) {
-        printf("FAIL: No Host header\n");
-        return 0;
-    }
-
-    host_pos += 6; // "Host: " 길이
-    char *end = strstr(host_pos, "\r\n");
-    if (!end) {
-        printf("FAIL: Host header no CRLF\n");
-        return 0;
-    }
-
-    int host_len = end - host_pos;
-    if (host_len <= 0 || host_len >= 256) {
-        printf("FAIL: Invalid Host length\n");
-        return 0;
-    }
-
-    char host[256] = {0};
-    strncpy(host, host_pos, host_len);
-    host[host_len] = '\0';
-
-    if (strcmp(host, malicious_host) == 0) {
-        printf("SUCCESS: Block malicious host: %s\n", host);
-        struct nfqnl_msg_packet_hdr *ph = nfq_get_msg_packet_hdr(tb);
-        return ph ? ntohl(ph->packet_id) : 0;
-    }
-
-    printf("SUCCESS: Host not malicious: %s\n", host);
-    struct nfqnl_msg_packet_hdr *ph = nfq_get_msg_packet_hdr(tb);
-    return ph ? ntohl(ph->packet_id) : 0;
+    // 대소문자 구분없이 완전 일치 비교
+    return (strcasecmp(host_only, mal_host) == 0);
 }
 
-static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg __attribute__((unused)),
-              struct nfq_data *nfa, void *data __attribute__((unused))) {
-    u_int32_t id = process_packet(nfa);
-    if (id == 0) {
-        printf("SUCCESS: Accepting packet (no drop)\n");
-        return nfq_set_verdict(qh, 0, NF_ACCEPT, 0, NULL);
+// Boyer-Moore 문자열 검색 알고리즘 (단순 버전)
+int bm_search(const char* text, int text_len, const char* pattern) {
+    int pat_len = strlen(pattern);
+    if (pat_len == 0 || text_len < pat_len) return -1;
+
+    int skip[256];
+    for (int i = 0; i < 256; i++) skip[i] = pat_len;
+    for (int i = 0; i < pat_len - 1; i++) skip[(unsigned char)pattern[i]] = pat_len - 1 - i;
+
+    int i = 0;
+    while (i <= text_len - pat_len) {
+        int j = pat_len - 1;
+        while (j >= 0 && pattern[j] == text[i + j]) j--;
+
+        if (j < 0) return i;
+        i += skip[(unsigned char)text[i + pat_len - 1]];
     }
 
-    printf("SUCCESS: Dropping packet with id: %u\n", id);
-    return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
+    return -1;
 }
+
+
+int process_packet(unsigned char* data, int len) {
+    struct iphdr* iph = (struct iphdr*)data;
+    if (iph->protocol != IPPROTO_TCP) return NF_ACCEPT;
+
+    int iphdr_len = iph->ihl * 4;
+    struct tcphdr* tcph = (struct tcphdr*)(data + iphdr_len);
+    int tcphdr_len = tcph->doff * 4;
+
+    if (ntohs(tcph->dest) != 80) return NF_ACCEPT;
+
+    unsigned char* payload = data + iphdr_len + tcphdr_len;
+    int payload_len = len - iphdr_len - tcphdr_len;
+
+    if (payload_len <= 0) return NF_ACCEPT;
+
+    int pos = bm_search((char*)payload, payload_len, "Host: ");
+    if (pos >= 0) {
+        char* host_start = (char*)payload + pos + 6;
+        char* host_end = strchr(host_start, '\r');
+        if (host_end && (host_end - host_start) < 256) {
+            char host[256] = {0};
+            strncpy(host, host_start, host_end - host_start);
+            host[host_end - host_start] = '\0';
+
+            printf("[+] Host: %s\n", host);
+
+            if (strcmp(host, "test.gilgil.net") == 0) {
+                printf("[-] Blocked domain!\n");
+                return NF_DROP;
+            }
+        }
+    }
+
+    return NF_ACCEPT;
+}
+
+static int cb(struct nfq_q_handle* qh, struct nfgenmsg* nfmsg,
+              struct nfq_data* nfa, void* data) {
+    struct nfqnl_msg_packet_hdr* ph = nfq_get_msg_packet_hdr(nfa);
+    uint32_t id = 0;
+    if (ph) id = ntohl(ph->packet_id);
+
+    unsigned char* packet_data;
+    int len = nfq_get_payload(nfa, &packet_data);
+    if (len >= 0) {
+        int verdict = process_packet(packet_data, len);
+        return nfq_set_verdict(qh, id, verdict, 0, NULL);
+    }
+
+    return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+}
+
 
 int main(int argc, char **argv) {
     if (argc != 2) {
@@ -98,10 +106,11 @@ int main(int argc, char **argv) {
     }
 
     malicious_host = argv[1];
+
     struct nfq_handle *h = nfq_open();
     if (!h) { perror("nfq_open"); exit(1); }
 
-    if (nfq_unbind_pf(h, AF_INET) < 0) { perror("nfq_unbind_pf"); /* 무시 가능 */ }
+    if (nfq_unbind_pf(h, AF_INET) < 0) { perror("nfq_unbind_pf"); }
     if (nfq_bind_pf(h, AF_INET) < 0) { perror("nfq_bind_pf"); exit(1); }
 
     struct nfq_q_handle *qh = nfq_create_queue(h, 0, &cb, NULL);
